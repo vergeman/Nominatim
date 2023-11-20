@@ -13,9 +13,12 @@ import sys
 import contextlib
 from pathlib import Path
 
+import sqlite3
+import aiosqlite
 import sqlalchemy as sa
+from sqlalchemy.pool import StaticPool, NullPool
 import sqlalchemy.ext.asyncio as sa_asyncio
-
+from sqlalchemy import text
 from nominatim.errors import UsageError
 from nominatim.db.sqlalchemy_schema import SearchTables
 from nominatim.db.async_core_library import PGCORE_LIB, PGCORE_ERROR
@@ -68,7 +71,7 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
         self._engine: Optional[sa_asyncio.AsyncEngine] = None
         self._tables: Optional[SearchTables] = None
         self._property_cache: Dict[str, Any] = {'DB:server_version': 0}
-
+        self._conn = None
 
     async def setup_database(self) -> None:
         """ Set up the SQL engine and connections.
@@ -89,8 +92,13 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
             if is_sqlite:
                 params = dict((p.split('=', 1)
                               for p in self.config.DATABASE_DSN[7:].split(';')))
-                dburl = sa.engine.URL.create('sqlite+aiosqlite',
-                                             database=params.get('dbname'))
+
+                dburlParams = "sqlite+aiosqlite:///__web__?vfs=web&mode=ro&immutable=1&web_url=https%3A//nominatim-testopresto.s3.us-east-2.amazonaws.com/convert-nominatim.sqlite'"
+                dbLocal = "sqlite+aiosqlite:///convert-nominatim.sqlite"
+
+                # gets superceded by Engine async_creator
+                dburl = dburlParams
+                print("dburl:", dburl)
 
             else:
                 dsn = self.config.get_database_params()
@@ -108,7 +116,74 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
                 extra_args['max_overflow'] = 0
                 extra_args['pool_size'] = self.config.get_int('API_POOL_SIZE')
 
-            engine = sa_asyncio.create_async_engine(dburl, **extra_args)
+            #
+            # create engine
+            #
+
+            async def async_creator():
+                print("creator start")
+                dburlVFS = 'file:/__web__?vfs=web&mode=ro&immutable=1&web_url=https%3A//nominatim-testopresto.s3.us-east-2.amazonaws.com/convert-nominatim.sqlite'
+                conn = await aiosqlite.connect(':memory:')
+                await conn.enable_load_extension(True)
+                await conn.execute("SELECT load_extension('mod_spatialite');")
+                await conn.execute("SELECT load_extension('/sqlite_web_vfs/work/build/web_vfs')")
+                await conn.enable_load_extension(False)
+                await conn.commit()
+                await conn.close()
+
+                _conn = await aiosqlite.connect(dburlVFS)
+                print('creator done', _conn)
+                return _conn
+
+            def creator():
+                print("sync creator start")
+                if self._conn2 is None:
+                    self._conn2 = sqlite3.connect(':memory:')
+                    self._conn2.enable_load_extension(True)
+                    self._conn2.execute("SELECT load_extension('mod_spatialite');")
+                    self._conn2.execute("SELECT load_extension('/sqlite_web_vfs/work/build/web_vfs')")
+                    self._conn2.enable_load_extension(False)
+                    self._conn2.close()
+
+                    self._conn = sqlite3.connect('file:/__web__')
+
+                print("load extension creator")
+                return self._conn
+
+
+            #engine = sa_asyncio.create_async_engine(dburl, **extra_args)
+
+            #
+            # TODO: NullPool required for now, otherwise connection
+            # hangs and doesn't properly exit.
+            #
+            engine = sa_asyncio.create_async_engine('sqlite+aiosqlite://',
+                                                    echo = True,
+                                                    poolclass=NullPool,
+                                                    async_creator=async_creator)
+
+            #NB: need to move event up here since creator fires and
+            # await try is below, need to register this earlier
+            #
+            # also do need to rerun this as otherwise extension
+            # doesn't register with queries not sure why
+            if is_sqlite:
+                @sa.event.listens_for(engine.sync_engine, "connect")
+                def _on_sqlite_connect(dbapi_con: Any, _: Any) -> None:
+                    print("onConnect")
+                    dbapi_con.run_async(lambda conn: conn.enable_load_extension(True))
+                    print("DBAPI", dbapi_con)
+                    cursor = dbapi_con.cursor()
+                    cursor.execute("SELECT load_extension('mod_spatialite')")
+                    cursor.execute("SELECT load_extension('/sqlite_web_vfs/work/build/web_vfs')")
+                    cursor.execute('SELECT SetDecimalPrecision(7)')
+                    print("LOAD EXTENSION DONE")
+                    dbapi_con.run_async(lambda conn: conn.enable_load_extension(False))
+                    print("onConnect Done")
+
+
+            print("ENGINE", engine)
+
 
             try:
                 async with engine.begin() as conn:
@@ -127,13 +202,27 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
                 await self.close()
 
             if is_sqlite:
-                @sa.event.listens_for(engine.sync_engine, "connect")
-                def _on_sqlite_connect(dbapi_con: Any, _: Any) -> None:
-                    dbapi_con.run_async(lambda conn: conn.enable_load_extension(True))
-                    cursor = dbapi_con.cursor()
-                    cursor.execute("SELECT load_extension('mod_spatialite')")
-                    cursor.execute('SELECT SetDecimalPrecision(7)')
-                    dbapi_con.run_async(lambda conn: conn.enable_load_extension(False))
+                # NB: event moved earlier
+
+                pass
+                #@sa.event.listens_for(engine.sync_engine, "connect")
+                #def _on_sqlite_connect(dbapi_con: Any, _: Any) -> None:
+                #    print("onConnect")
+                    # dbapi_con.run_async(lambda conn: conn.enable_load_extension(True))
+                    # cursor = dbapi_con.cursor()
+                    # cursor.execute("SELECT load_extension('mod_spatialite')")
+                    # cursor.execute("SELECT load_extension('/sqlite_web_vfs/work/build/web_vfs')")
+                    # cursor.execute('SELECT SetDecimalPrecision(7)')
+                    # print("LOAD EXTENSION DONE")
+                    # dbapi_con.run_async(lambda conn: conn.enable_load_extension(False))
+                # @sa.event.listens_for(engine.sync_engine, "do_connect")
+                # def receive_do_connect(dialect, conn_rec, cargs, cparams):
+                #     # return the new DBAPI connection with whatever we'd like to
+                #     # do
+                #     print("doConnect")
+
+
+
 
             self._property_cache['DB:server_version'] = server_version
 
@@ -146,6 +235,7 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
             object remains usable after closing. If a new API functions is
             called, new connections are created.
         """
+        print("CLOSE")
         if self._engine is not None:
             await self._engine.dispose()
 
@@ -159,14 +249,19 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
             the connection object.
         """
         if self._engine is None:
+            print("--SETUP--")
             await self.setup_database()
 
         assert self._engine is not None
         assert self._tables is not None
 
         async with self._engine.begin() as conn:
+            print("--BEGIN--")
             yield SearchConnection(conn, self._tables, self._property_cache)
-
+            #works
+            # result = await self._conn.execute("SELECT * from placex limit 2;")
+            # row = await result.fetchall()
+            # print(row)
 
     async def status(self) -> StatusResult:
         """ Return the status of the database.
@@ -175,6 +270,7 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
             async with self.begin() as conn:
                 conn.set_query_timeout(self.query_timeout)
                 status = await get_status(conn)
+
         except (PGCORE_ERROR, sa.exc.OperationalError):
             return StatusResult(700, 'Database connection failed')
 
@@ -360,6 +456,7 @@ class NominatimAPI:
             This function also closes the asynchronous worker loop making
             the NominatimAPI object unusuable.
         """
+        print("CLOSE API")
         self._loop.run_until_complete(self._async_api.close())
         self._loop.close()
 
