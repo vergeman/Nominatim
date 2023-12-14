@@ -16,6 +16,10 @@ from pathlib import Path
 import sqlalchemy as sa
 import sqlalchemy.ext.asyncio as sa_asyncio
 
+from sqlalchemy.pool import StaticPool, NullPool
+import sqlite3
+import aiosqlite
+
 from nominatim.errors import UsageError
 from nominatim.db.sqlalchemy_schema import SearchTables
 from nominatim.db.async_core_library import PGCORE_LIB, PGCORE_ERROR
@@ -119,7 +123,29 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
                            port=int(dsn['port']) if 'port' in dsn else None,
                            query=query)
 
-            engine = sa_asyncio.create_async_engine(dburl, **extra_args)
+            #engine = sa_asyncio.create_async_engine(dburl, **extra_args)
+            async def async_creator():
+                print("async_creator start")
+                dburlVFS = 'file:/__web__?vfs=web&mode=ro&immutable=1&web_url=https%3A//nominatim-testopresto.s3.us-east-2.amazonaws.com/mydb.sqlite'
+                conn = await aiosqlite.connect(':memory:')
+                await conn.enable_load_extension(True)
+                await conn.execute("SELECT load_extension('mod_spatialite');")
+                await conn.execute("SELECT load_extension('/sqlite_web_vfs/work/build/web_vfs')")
+                await conn.enable_load_extension(False)
+                await conn.commit()
+                await conn.close()
+
+                _conn = await aiosqlite.connect(dburlVFS)
+                print('async_creator done', _conn)
+                return _conn
+            #
+            # TODO: NullPool required for now, otherwise connection
+            # hangs and doesn't properly exit.
+            #
+            engine = sa_asyncio.create_async_engine('sqlite+aiosqlite://',
+                                                    echo = True,
+                                                    poolclass=NullPool,
+                                                    async_creator=async_creator)
 
             if is_sqlite:
                 server_version = 0
@@ -131,6 +157,7 @@ class NominatimAPIAsync: #pylint: disable=too-many-instance-attributes
                     cursor = dbapi_con.cursor()
                     cursor.execute("SELECT load_extension('mod_spatialite')")
                     cursor.execute('SELECT SetDecimalPrecision(7)')
+                    cursor.execute("SELECT load_extension('/sqlite_web_vfs/work/build/web_vfs')")
                     dbapi_con.run_async(lambda conn: conn.enable_load_extension(False))
             else:
                 try:
